@@ -126,6 +126,7 @@ void* get_spec_ref(df::building* b, spec_ref_enum_t type) {
 struct MovingMachine {
 	static const int32_t TILE_DIMEN = 100000;
     static const int32_t GRAVITY = 5000;
+    static const int16_t WEAR_FACTOR = 50;
     static const std::set<df::tiletype> OPEN_TILES;
 
 	int32_t offsetx;
@@ -137,6 +138,7 @@ struct MovingMachine {
     int32_t wanted_momentumx;
     int32_t wanted_momentumy;
     int32_t wanted_momentumz;
+    bool collided;
 	df::coord ref;
     std::set<df::coord> rel_positions;
     int lowest_relz;
@@ -155,6 +157,7 @@ struct MovingMachine {
 	   wanted_momentumx(0),
 	   wanted_momentumy(0),
 	   wanted_momentumz(0),
+	   collided(false),
 	   ref(c->pos),
 	   rel_positions({ df::coord { 0, 0, 0 } }),
 	   cmembers({ c }),
@@ -196,11 +199,29 @@ struct MovingMachine {
         std::ofstream log("moving-machines-log.txt", std::ios_base::app);
         log << "BUILDING COLLISION: " << b->id << std::endl;
         log << "COLLIDED TERRAIN LOC: " << new_loc.x << " " << new_loc.y << " " << new_loc.z << std::endl;
-        if (new_loc.z != old_loc.z) momentumz = wanted_momentumz;
-        else {
-            if (new_loc.x != old_loc.x) momentumx = wanted_momentumx;
-            if (new_loc.y != old_loc.y) momentumy = wanted_momentumy;
+        int16_t dwear = 0;
+        if (new_loc.z != old_loc.z) {
+            dwear = WEAR_FACTOR * momentumz;
+            momentumz = wanted_momentumz;
+        } else {
+            if (new_loc.x != old_loc.x) {
+                dwear = WEAR_FACTOR * momentumx;
+                momentumx = wanted_momentumx;
+            }
+            if (new_loc.y != old_loc.y) {
+                dwear = WEAR_FACTOR * momentumy;
+                momentumy = wanted_momentumy;
+            }
         }
+        log << "dwear: " << dwear << std::endl;
+        if (collided) return;
+        /*
+        log << "collided for first time; add wear" << std::endl;
+        for (auto ci : ((df::building_actual*)b)->contained_items) {
+            log << "ci->item->id: " << ci->item->id << std::endl;
+            ci->item->addWear(dwear, true, true);
+        }
+        */
     }
     
     int get_mass() {
@@ -223,6 +244,20 @@ struct MovingMachine {
     
     bool contains(df::coord pos) {
         return rel_positions.count(get_rel_pos(pos)) > 0;
+    }
+    
+    bool is_usable_ramp(df::coord old_pos, int16_t dx, int16_t dy) {
+        ++old_pos.z;
+        df::coord new_pos {
+            old_pos.x + dx,
+            old_pos.y + dy,
+            old_pos.z
+        };
+        df::map_block* old_block = get_map_block(old_pos);
+        df::map_block* new_block = get_map_block(new_pos);
+        df::tiletype old_tile = old_block->tiletype[old_pos.x%16][old_pos.y%16];
+        return old_tile == df::tiletype::RampTop
+          && new_block->walkable[new_pos.x%16][new_pos.y%16];
     }
     
     void add_spec_ref(df::building* b) {
@@ -329,6 +364,18 @@ struct MovingMachine {
         if (translatex == 0 && translatey == 0 && translatez == 0) {
             return;
         }
+        bool move_up = false;
+        for (df::construction* c : cmembers) {
+            if (is_usable_ramp(c->pos, translatex, translatey)) {
+                move_up = true;
+                break;
+            }
+        }
+        if (move_up) {
+            ++translatez;
+            if (translatex) translatex -= GRAVITY;
+            if (translatey) translatey -= GRAVITY;
+        }
         std::map<df::construction*, df::coord> to_move;
         bool is_collision = false;
 		for (df::construction* c : cmembers) {
@@ -362,7 +409,11 @@ struct MovingMachine {
                 }
             }
         }
-        if (is_collision) return;
+        if (is_collision) {
+            collided = true;
+            return;
+        }
+        collided = false;
         for (df::construction* c : cmembers) {
             Burrows::setAssignedBlockTile(
                 um_burrow,
