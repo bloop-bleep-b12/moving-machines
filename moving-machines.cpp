@@ -9,6 +9,7 @@
 #include "modules/Buildings.h"
 #include "modules/Screen.h"
 #include "modules/Gui.h"
+#include "modules/Burrows.h"
 
 using namespace DFHack;
 
@@ -25,6 +26,8 @@ using namespace DFHack;
 #include "df/machine.h"
 #include "df/machine_info.h"
 #include "df/power_info.h"
+#include "df/unit.h"
+#include "df/burrow.h"
 #include "df/ui.h"
 #include "df/ui_sidebar_mode.h"
 #include "df/viewscreen_dwarfmodest.h"
@@ -37,7 +40,7 @@ using namespace df::enums;
 #include <algorithm>
 #include <sstream>
 #include <fstream>
-#include <mutex>
+#include <algorithm>
 
 DFHACK_PLUGIN("moving-machines");
 REQUIRE_GLOBAL(world);
@@ -93,6 +96,12 @@ void move_machine(df::machine* m, df::coord translation) {
     }
 }
 
+void move_unit(df::unit* u, df::coord  translation) {
+    u->pos.x += translation.x;
+    u->pos.y += translation.y;
+    u->pos.z += translation.z;
+}
+
 df::machine* get_machine(df::building* b) {
     df::machine_info* info = b->getMachineInfo();
     if (info == nullptr) return nullptr;
@@ -130,6 +139,8 @@ struct MovingMachine {
     int lowest_relz;
 	std::set<df::construction*> cmembers;
 	std::set<df::building*> bmembers;
+    std::set<df::unit*> umembers;
+    df::burrow* um_burrow;
 
 	MovingMachine(df::construction* c)
 	 : offsetx(50000),
@@ -144,7 +155,28 @@ struct MovingMachine {
 	   ref(c->pos),
 	   rel_positions({ df::coord { 0, 0, 0 } }),
 	   cmembers({ c }),
-	   bmembers() {}
+	   bmembers(),
+	   umembers(),
+	   um_burrow(new df::burrow) {
+        std::vector<df::burrow*>& burrow_vec = df::burrow::get_vector();
+        um_burrow->id = burrow_vec.size();
+        um_burrow->name = "";
+        um_burrow->tile = 0;
+        um_burrow->fg_color = 0;
+        um_burrow->bg_color = 0;
+        // um_burrow->limit_workshops = /* TBD */;
+        insert_into_vector(burrow_vec, &df::burrow::id, um_burrow);
+        Burrows::setAssignedBlockTile(
+            um_burrow,
+            get_map_block(c->pos),
+            df::coord2d { c->pos.x % 16, c->pos.y % 16 },
+            true
+        );
+    }
+    
+    bool unit_passable() {
+        return momentumx == 0 && momentumy == 0 && momentumz == 0;
+    }
     
     void register_collision(df::construction* c, df::coord new_loc) {
         std::ofstream log("moving-machines-log.txt", std::ios_base::app);
@@ -211,6 +243,7 @@ struct MovingMachine {
         log << num_steps << std::endl;
         log << momentumy << std::endl;
         log << num_steps * momentumy << std::endl;
+        log << "begin registering new mmembers" << std::endl;
         std::set<df::machine*> mmembers;
         for (df::building* b : bmembers) {
             df::machine* m = get_machine(b);
@@ -218,6 +251,8 @@ struct MovingMachine {
                 mmembers.insert(m);
             }
         }
+        log << "done (registering new mmembers)" << std::endl;
+        log << "begin registering MV_MACHINE spec refs" << std::endl;
         for (df::machine* m : mmembers) {
             for (df::machine::T_components* comp : m->components) {
                 df::building* b = df::building::find(comp->building_id);
@@ -228,6 +263,33 @@ struct MovingMachine {
                 }
             }
         }
+        log << "done (registering MV_MACHINE spec refs)" << std::endl;
+        if (momentumx == 0 && momentumy == 0 && momentumz == 0) {
+            log << "stationary; disabling burrow" << std::endl;
+            Burrows::clearUnits(um_burrow);
+            return;
+        }
+        log << "begin removing obsolete units" << std::endl;
+        for (std::set<df::unit*>::iterator i = umembers.begin();
+               i != umembers.end(); ++i) {
+            if (!contains((*i)->pos)) {
+                Burrows::setAssignedUnit(um_burrow, *i, false);
+                umembers.erase(i);
+            }
+        }
+        log << "done (removing obsolete units)" << std::endl;
+        log << "begin adding new units" << std::endl;
+        for (df::unit* u : world->units.active) {
+            log << "u->id: " << u->id << std::endl;
+            if (!contains(u->pos)) continue;
+            log << "not on moving machine" << std::endl;
+            if (umembers.count(u) == 0) {
+                log << "adding to burrow" << std::endl;
+                Burrows::setAssignedUnit(um_burrow, u, true);
+                umembers.insert(u);
+            }
+        }
+        log << "done (adding new units)" << std::endl;
         int mass = get_mass();
         int32_t velx = momentumx / mass;
         int32_t vely = momentumy / mass;
@@ -261,7 +323,9 @@ struct MovingMachine {
         log << "; z=";
         log << offsetz;
         log << std::endl;
-        if (translatex == 0 && translatey == 0 && translatez == 0) return;
+        if (translatex == 0 && translatey == 0 && translatez == 0) {
+            return;
+        }
         std::map<df::construction*, df::coord> to_move;
         bool is_collision = false;
 		for (df::construction* c : cmembers) {
@@ -296,6 +360,14 @@ struct MovingMachine {
             }
         }
         if (is_collision) return;
+        for (df::construction* c : cmembers) {
+            Burrows::setAssignedBlockTile(
+                um_burrow,
+                get_map_block(c->pos),
+                df::coord2d { c->pos.x % 16, c->pos.y % 16 },
+                false
+            );
+        }
         for (auto i = to_move.begin(); i != to_move.end(); ++i) {
             df::construction* c = i->first;
             df::coord new_pos = i->second;
@@ -331,12 +403,21 @@ struct MovingMachine {
             old_block->tiletype[cx%16][cy%16] = orig_tile;
             // actually move c
             c->pos = new_pos;
+            Burrows::setAssignedBlockTile(
+                um_burrow,
+                get_map_block(c->pos),
+                df::coord2d { c->pos.x % 16, c->pos.y % 16 },
+                true
+            );
         }
         df::coord translate {
             translatex,
             translatey,
             translatez
         };
+        for (df::unit* u : umembers) {
+            move_unit(u, translate);
+        }
         for (df::machine* m : mmembers) {
             move_machine(m, translate);
         }
@@ -842,6 +923,9 @@ command_result read_status(color_ostream& out, const std::vector<std::string>& p
     out.print("\n");
     out.print("# bmembers: ");
     out.print(int_to_str(m->bmembers.size()).c_str());
+    out.print("\n");
+    out.print("# umembers: ");
+    out.print(int_to_str(m->umembers.size()).c_str());
     out.print("\n");
 	return CR_OK;
 }
