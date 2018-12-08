@@ -47,6 +47,7 @@ REQUIRE_GLOBAL(world);
 REQUIRE_GLOBAL(pause_state);
 REQUIRE_GLOBAL(cursor);
 REQUIRE_GLOBAL(ui);
+REQUIRE_GLOBAL(selection_rect);
 
 static const uint32_t B_FLAG_PLATFORM = 0x100U;
 static const uint32_t B_FLAG_CLEARED = 0x200U;
@@ -692,21 +693,6 @@ IMPLEMENT_VMETHOD_INTERPOSE(wheel_hook, isUnpowered);
 IMPLEMENT_VMETHOD_INTERPOSE(wheel_hook, categorize);
 IMPLEMENT_VMETHOD_INTERPOSE(wheel_hook, uncategorize);
 
-struct dwarfmode_hook_info {
-    bool in_plat_menu;
-    bool selected_first_corner;
-    df::coord first_corner;
-    
-    dwarfmode_hook_info() :
-      in_plat_menu(false),
-      selected_first_corner(false),
-      first_corner { 0, 0, 0 } {}
-    
-    Screen::Painter get_sidebar_painter() {
-      return Screen::Painter(Gui::getDwarfmodeViewDims().menu());
-    }
-};
-
 void desig_platform(df::coord corner1, df::coord corner2) {
     int16_t min_x = std::min(corner1.x, corner2.x);
     int16_t max_x = std::max(corner1.x, corner2.x);
@@ -734,17 +720,13 @@ void desig_platform(df::coord corner1, df::coord corner2) {
 struct dwarfmode_hook : df::viewscreen_dwarfmodest {
     typedef df::viewscreen_dwarfmodest interpose_base;
     
-    static dwarfmode_hook_info info;
+    static bool in_plat_menu;
     static const std::set<smode_enum_t> DESIG_MODES;
     static const long MIN_DESIGNATE_KEY = 0x48F;
     static const long MAX_DESIGNATE_KEY = 0x4B4;
     
     bool in_desig_menu() {
         return DESIG_MODES.count(ui->main.mode) > 0;
-    }
-    
-    bool in_desig_plat_menu() {
-        return info.in_plat_menu;
     }
     
     DEFINE_VMETHOD_INTERPOSE(void, feed, (std::set<df::interface_key>* keys)) {
@@ -762,29 +744,37 @@ struct dwarfmode_hook : df::viewscreen_dwarfmodest {
                 log << "ENTERING PLATFORM MENU" << std::endl;
                 ui->main.mode = smode_enum_t::DesignateMine;
                 log << "CHECKPOINT 1" << std::endl;
-                info.in_plat_menu = true;
+                in_plat_menu = true;
                 log << "CHECKPOINT 2" << std::endl;
             }
-            if (!in_desig_plat_menu()) {
-                log << "!in_desig_plat_menu()" << std::endl;
+            if (!in_plat_menu) {
+                log << "!in_plat_menu" << std::endl;
                 propagate.insert(k);
                 continue;
             }
             if (k == df::interface_key::SELECT) {
-                df::coord cursor_pos { cursor->x, cursor->y, cursor->z };
-                if (info.selected_first_corner) {
-                    desig_platform(info.first_corner, cursor_pos);
-                } else {
-                    info.first_corner = cursor_pos;
+                df::coord start { 
+                    selection_rect->start_x,
+                    selection_rect->start_y,
+                    selection_rect->start_z
+                };
+                if (start.x < 0) {
+                    propagate.insert(k);
+                    continue;
                 }
-                info.selected_first_corner = !info.selected_first_corner;
+                df::coord end { 
+                    cursor->x,
+                    cursor->y,
+                    cursor->z
+                };
+                desig_platform(start, end);
+                selection_rect->start_x = -30000;
+                selection_rect->start_y = -30000;
+                selection_rect->start_z = -30000;
             } else {
                 propagate.insert(k);
                 if (MIN_DESIGNATE_KEY <= (long)k
-                         && (long)k <= MAX_DESIGNATE_KEY) {
-                    info.in_plat_menu = false;
-                    info.selected_first_corner = false;
-                }
+                      && (long)k <= MAX_DESIGNATE_KEY) in_plat_menu = false;
             }
         }
         log << "OUT OF LOOP" << std::endl;
@@ -798,16 +788,16 @@ struct dwarfmode_hook : df::viewscreen_dwarfmodest {
         CoreSuspendClaimer claimer;
         INTERPOSE_NEXT(render)();
         if (!in_desig_menu()) {
-            info.in_plat_menu = false;
-            info.selected_first_corner = false;
+            in_plat_menu = false;
             return;
         }
-        Screen::Painter p = info.get_sidebar_painter();
+        Gui::DwarfmodeDims dims = Gui::getDwarfmodeViewDims();
+        Screen::Painter p = Screen::Painter(dims.menu());
         Screen::Pen green_pen(' ', 2, 0, true);
         Screen::Pen text_pen(' ', 7, 0, false);
         Screen::Pen bold_pen(' ', 7, 0, true);
         p.seek(2, 1);
-        if (info.in_plat_menu) {
+        if (in_plat_menu) {
             p.pen(text_pen);
             p.string(": Mine");
         } else if (ui->main.mode == smode_enum_t::DesignateMine) {
@@ -817,12 +807,12 @@ struct dwarfmode_hook : df::viewscreen_dwarfmodest {
         p.seek(1, 17);
         p.pen(green_pen);
         p.tile('P');
-        p.pen(info.in_plat_menu ? bold_pen : text_pen);
+        p.pen(in_plat_menu ? bold_pen : text_pen);
         p.string(": Create Platform");
     }
 };
 
-dwarfmode_hook_info dwarfmode_hook::info;
+bool dwarfmode_hook::in_plat_menu = false;
 
 const std::set<smode_enum_t> dwarfmode_hook::DESIG_MODES {
     smode_enum_t::DesignateMine,
