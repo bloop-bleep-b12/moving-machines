@@ -374,6 +374,11 @@ struct MovingMachine {
         for (auto i = to_move.begin(); i != to_move.end(); ++i) {
             df::construction* c = i->first;
             df::coord new_pos = i->second;
+            log << "c: " << c << std::endl;
+            log << "new_pos: ";
+            log << new_pos.x << " ";
+            log << new_pos.y << " ";
+            log << new_pos.z << std::endl;
             int16_t cx = c->pos.x;
             int16_t cy = c->pos.y;
             int16_t newx = new_pos.x;
@@ -389,12 +394,24 @@ struct MovingMachine {
             // tiletype of c
             df::tiletype new_tile = old_block->tiletype[cx%16][cy%16];
             // if c is moving into a construction inside this machine...
-            if (contains(new_pos) > 0) {
+            df::construction* next_c = nullptr;
+            for (df::construction* ic : cmembers) {
+                if (ic->pos.x == new_pos.x 
+                      && ic->pos.y == new_pos.y
+                      && ic->pos.z == new_pos.z) {
+                    next_c = ic;
+                    break;
+                }
+            }
+            if (next_c != nullptr) {
                 // update the original_tile of that construction to be the same
                 // as c's tiletype (so that the tiletype isn't overwritten when
                 // that construction moves)
-                df::construction* next_c = df::construction::find(new_pos);
-                log << next_c << std::endl;
+                log << "new_pos: ";
+                log << new_pos.x << " ";
+                log << new_pos.y << " ";
+                log << new_pos.z << std::endl;
+                log << "next_c: " << next_c << std::endl;
                 old_tile = next_c->original_tile;
                 next_c->original_tile = new_tile;
             }
@@ -474,6 +491,9 @@ void gen_newlocs(df::construction* c, MovingMachine* m) {
 }
 
 void handle_new_platform(df::construction* c) {
+    static const int16_t MIN_CONSTR_WALL_TILE = 0x1EB;
+    static const int16_t MAX_CONSTR_WALL_TILE = 0x1FE;
+    
     std::ofstream log("moving-machines-log.txt", std::ios_base::app);
     log << "handle_new_platform" << std::endl;
     if (c->flags.whole & C_FLAG_PLATFORM) return;
@@ -496,6 +516,23 @@ void handle_new_platform(df::construction* c) {
 	oldlocs.insert(std::make_pair(c->pos, m));
 	gen_newlocs(c, m);
     c->flags.whole |= C_FLAG_PLATFORM;
+    df::map_block* b = get_map_block(c->pos);
+    int16_t t = (int16_t)(b->tiletype[c->pos.x%16][c->pos.y%16]);
+    log << "TILETYPE: " << t << std::endl;
+    if (MIN_CONSTR_WALL_TILE <= t && t <= MAX_CONSTR_WALL_TILE) {
+        log << "is wall" << std::endl;
+        df::coord above_pos = c->pos;
+        ++above_pos.z;
+        df::construction* above_floor = df::construction::find(above_pos);
+        log << "above_floor: " << above_floor << std::endl;
+        df::coord rel_pos = m->get_rel_pos(above_pos);
+        m->rel_positions.insert(rel_pos);
+        m->cmembers.insert(above_floor);
+        oldlocs.insert(std::make_pair(above_pos, m));
+        gen_newlocs(above_floor, m);
+        above_floor->flags.whole |= C_FLAG_PLATFORM;
+    }
+    log << "DONE handle_platform" << std::endl;
 }
 
 void handle_new_building(df::building* b) {
