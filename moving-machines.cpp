@@ -61,6 +61,7 @@ typedef df::ui_sidebar_mode smode_enum_t;
 
 int str_to_int(const std::string& s) {
     std::stringstream ss;
+    ss.exceptions(std::ios_base::failbit);
     int ret;
     ss << s;
     ss >> ret;
@@ -69,6 +70,7 @@ int str_to_int(const std::string& s) {
 
 std::string int_to_str(int n) {
     std::stringstream ss;
+    ss.exceptions(std::ios_base::failbit);
     std::string ret;
     ss << n;
     ss >> ret;
@@ -734,6 +736,8 @@ struct dwarfmode_hook : df::viewscreen_dwarfmodest {
     
     static dwarfmode_hook_info info;
     static const std::set<smode_enum_t> DESIG_MODES;
+    static const long MIN_DESIGNATE_KEY = 0x48F;
+    static const long MAX_DESIGNATE_KEY = 0x4B4;
     
     bool in_desig_menu() {
         return DESIG_MODES.count(ui->main.mode) > 0;
@@ -776,7 +780,11 @@ struct dwarfmode_hook : df::viewscreen_dwarfmodest {
                 info.selected_first_corner = !info.selected_first_corner;
             } else {
                 propagate.insert(k);
-                continue;
+                if (MIN_DESIGNATE_KEY <= (long)k
+                         && (long)k <= MAX_DESIGNATE_KEY) {
+                    info.in_plat_menu = false;
+                    info.selected_first_corner = false;
+                }
             }
         }
         log << "OUT OF LOOP" << std::endl;
@@ -853,11 +861,35 @@ IMPLEMENT_VMETHOD_INTERPOSE(dwarfmode_hook, render);
 
 // Main loop logic
 
+struct dfhack_exception : std::exception {
+    virtual const char* what() const noexcept {
+        return "DFHACK ERROR";
+    }
+};
+
 bool active = false;
 const unsigned int DEFAULT_SPEED = 5;
 unsigned int speed = DEFAULT_SPEED;
 
 typedef command_result (*op_func_t)(color_ostream&, const std::vector<std::string>&);
+
+unsigned int read_uint(color_ostream& out, const std::vector<std::string>& params, unsigned int p_index) {
+    int ret;
+    bool error = false;
+    try {
+        ret = str_to_int(params[p_index]);
+    } catch (std::ios_base::failure& e) {
+        error = true;
+    }
+    if (ret < 0) error = true;
+    if (error) {
+        out.printerr("Parameter #");
+        out.printerr(int_to_str(p_index).c_str());
+        out.printerr(" is not a nonnegative integer.\n");
+        throw dfhack_exception();
+    }
+    return ret;
+}
 
 command_result start_system(color_ostream& out, const std::vector<std::string>& params) {
 	if (params.size() != 1) {
@@ -894,40 +926,66 @@ command_result stop_system(color_ostream& out, const std::vector<std::string>& p
 }
 
 command_result read_status(color_ostream& out, const std::vector<std::string>& params) {
-	if (params.size() > 2) {
-		out.printerr("Invalid number of parameters!\n");
-		return CR_FAILURE;
-	}
-	out.print(active ? "ACTIVE\n" : "INACTIVE\n");
-	out.print("update speed: ");
-	out.print(int_to_str(speed).c_str());
-    out.print("\n");
-    out.print("# moving machines: ");
-    out.print(int_to_str(machines.size()).c_str());
-    out.print("\n");
-    out.print("# old locs: ");
-    out.print(int_to_str(oldlocs.size()).c_str());
-    out.print("\n");
-    out.print("# new locs: ");
-    out.print(int_to_str(newlocs.size()).c_str());
-    out.print("\n");
-    if (params.size() == 1) return CR_OK;
-    out.print("\n");
-    unsigned int id = str_to_int(params[1]);
-    MovingMachine* m = machines[id];
-    out.print("moving machine #");
-    out.print(int_to_str(id).c_str());
-    out.print("\n====================\n");
-    out.print("# cmembers: ");
-    out.print(int_to_str(m->cmembers.size()).c_str());
-    out.print("\n");
-    out.print("# bmembers: ");
-    out.print(int_to_str(m->bmembers.size()).c_str());
-    out.print("\n");
-    out.print("# umembers: ");
-    out.print(int_to_str(m->umembers.size()).c_str());
-    out.print("\n");
-	return CR_OK;
+    MovingMachine* m;
+    switch (params.size()) {
+        case 1:
+            out.print(active ? "ACTIVE\n" : "INACTIVE\n");
+            out.print("update speed: ");
+            out.print(int_to_str(speed).c_str());
+            out.print("\n");
+            out.print("# moving machines: ");
+            out.print(int_to_str(machines.size()).c_str());
+            out.print("\n");
+            out.print("# old locs: ");
+            out.print(int_to_str(oldlocs.size()).c_str());
+            out.print("\n");
+            out.print("# new locs: ");
+            out.print(int_to_str(newlocs.size()).c_str());
+            out.print("\n");
+            return CR_OK;
+        case 2:
+            unsigned int id;
+            try {
+                id = read_uint(out, params, 1);
+            } catch (dfhack_exception& e) {
+                return CR_FAILURE;
+            }
+            if (id >= machines.size()) {
+                out.printerr("Invalid moving machine id!\n");
+                return CR_FAILURE;
+            }
+            m = machines[id];
+            out.print("moving machine #");
+            out.print(int_to_str(id).c_str());
+            out.print("\n====================\n");
+            out.print("ref pos: ");
+            out.print(int_to_str(m->ref.x).c_str());
+            out.print(" ");
+            out.print(int_to_str(m->ref.y).c_str());
+            out.print(" ");
+            out.print(int_to_str(m->ref.z).c_str());
+            out.print("\n");
+            out.print("momentum: ");
+            out.print(int_to_str(m->momentumx).c_str());
+            out.print(" ");
+            out.print(int_to_str(m->momentumy).c_str());
+            out.print(" ");
+            out.print(int_to_str(m->momentumz).c_str());
+            out.print("\n");
+            out.print("# cmembers: ");
+            out.print(int_to_str(m->cmembers.size()).c_str());
+            out.print("\n");
+            out.print("# bmembers: ");
+            out.print(int_to_str(m->bmembers.size()).c_str());
+            out.print("\n");
+            out.print("# umembers: ");
+            out.print(int_to_str(m->umembers.size()).c_str());
+            out.print("\n");
+            return CR_OK;
+        default:
+            out.printerr("Invalid number of parameters!\n");
+            return CR_FAILURE;
+    }
 }
 
 command_result change_speed(color_ostream& out, const std::vector<std::string>& params) {
@@ -935,7 +993,11 @@ command_result change_speed(color_ostream& out, const std::vector<std::string>& 
 		out.printerr("Invalid number of parameters!\n");
 		return CR_FAILURE;
 	}
-	speed = str_to_int(params[1]);
+	try {
+        speed = read_uint(out, params, 1);
+    } catch (dfhack_exception& e) {
+        return CR_FAILURE;
+    }
 	return CR_OK;
 }
 
@@ -944,11 +1006,14 @@ command_result register_platform(color_ostream& out, const std::vector<std::stri
         out.printerr("Invalid number of parameters!\n");
         return CR_FAILURE;
     }
-    df::coord pos {
-        str_to_int(params[1]),
-        str_to_int(params[2]),
-        str_to_int(params[3])
-    };
+    df::coord pos;
+    try {
+        pos.x = read_uint(out, params, 1);
+        pos.y = read_uint(out, params, 2);
+        pos.z = read_uint(out, params, 3);
+    } catch (dfhack_exception& e) {
+        return CR_FAILURE;
+    }
     out.print(params[1].c_str());
     out.print(" ");
     out.print(params[2].c_str());
@@ -974,18 +1039,21 @@ command_result link_building(color_ostream& out, const std::vector<std::string>&
         out.printerr("Invalid number of parameters!\n");
         return CR_FAILURE;
     }
-    df::coord pos {
-        str_to_int(params[1]),
-        str_to_int(params[2]),
-        str_to_int(params[3])
-    };
+    df::coord pos;
+    try {
+        pos.x = read_uint(out, params, 1);
+        pos.y = read_uint(out, params, 2);
+        pos.z = read_uint(out, params, 3);
+    } catch (dfhack_exception& e) {
+        return CR_FAILURE;
+    }
     df::building* b = Buildings::findAtTile(pos);
     out.print(int_to_str(b->x1).c_str());
     out.print(" ");
     out.print(int_to_str(b->y1).c_str());
     out.print(" ");
-    //out.print(int_to_str(b->z).c_str());
-    //out.print("\n");
+    out.print(int_to_str(b->z).c_str());
+    out.print("\n");
     handle_new_building(b);
     return CR_OK;
 }    
@@ -995,15 +1063,20 @@ command_result accel_machine(color_ostream& out, const std::vector<std::string>&
         out.printerr("Invalid number of parameters!\n");
         return CR_FAILURE;
     }
-    unsigned int id = str_to_int(params[1]);
-    df::coord dv {
-        str_to_int(params[2]),
-        str_to_int(params[3]),
-        str_to_int(params[4])
-    };
+    unsigned int id;
+    df::coord dv;
+    try {
+        id = read_uint(out, params, 1);
+        dv.x = read_uint(out, params, 2);
+        dv.y = read_uint(out, params, 3);
+        dv.z = read_uint(out, params, 4);
+    } catch (dfhack_exception& e) {
+        return CR_FAILURE;
+    }
     machines[id]->momentumx += dv.x;
     machines[id]->momentumy += dv.y;
     machines[id]->momentumz += dv.z;
+    return CR_OK;
 }
 
 command_result update_machines(color_ostream& out, const std::vector<std::string>& params) {
