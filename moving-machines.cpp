@@ -6,10 +6,11 @@
 #include "VTableInterpose.h"
 #include "MiscUtils.h"
 
+#include "modules/World.h"
 #include "modules/Buildings.h"
+#include "modules/Burrows.h"
 #include "modules/Screen.h"
 #include "modules/Gui.h"
-#include "modules/Burrows.h"
 
 using namespace DFHack;
 
@@ -121,6 +122,12 @@ void* get_spec_ref(df::building* b, spec_ref_enum_t type) {
     return ret;
 }
 
+bool in_map_bounds(df::coord pos) {
+    return 0 <= pos.x && pos.x < world->map.x_count
+        && 0 <= pos.y && pos.y < world->map.y_count
+        && 0 <= pos.z && pos.z < world->map.z_count;
+}
+
 // Core logic
 
 struct MovingMachine {
@@ -164,20 +171,34 @@ struct MovingMachine {
 	   bmembers(),
 	   umembers(),
 	   um_burrow(new df::burrow) {
+        std::ofstream log("moving-machines-log.txt", std::ios_base::app);
         std::vector<df::burrow*>& burrow_vec = df::burrow::get_vector();
         um_burrow->id = burrow_vec.size();
         um_burrow->name = "";
         um_burrow->tile = 0;
         um_burrow->fg_color = 0;
         um_burrow->bg_color = 0;
+        new (&um_burrow->block_x) std::vector<int32_t>;
+        new (&um_burrow->block_y) std::vector<int32_t>;
+        new (&um_burrow->block_z) std::vector<int32_t>;
+        new (&um_burrow->units) std::vector<int32_t>;
+        log << ".size(): " << um_burrow->block_x.size() << std::endl;
         // um_burrow->limit_workshops = /* TBD */;
         insert_into_vector(burrow_vec, &df::burrow::id, um_burrow);
+        df::map_block* block = get_map_block(c->pos);
         Burrows::setAssignedBlockTile(
             um_burrow,
-            get_map_block(c->pos),
+            block,
             df::coord2d { c->pos.x % 16, c->pos.y % 16 },
             true
         );
+        log << ".size(): " << um_burrow->block_x.size() << std::endl;
+    }
+    
+    ~MovingMachine() {
+        std::vector<df::burrow*>& burrow_vec = df::burrow::get_vector();
+        erase_from_vector(burrow_vec, &df::burrow::id, um_burrow->id);
+        delete um_burrow;
     }
     
     bool unit_passable() {
@@ -273,6 +294,45 @@ struct MovingMachine {
         log << "CHECKPOINT 4" << std::endl;
         b->specific_refs.push_back(r);
         log << "CHECKPOINT 5" << std::endl;
+    }
+    
+    void merge(MovingMachine* other) {
+        std::ofstream log("moving-machines-log.txt", std::ios_base::app);
+        log << "other: " << other << std::endl;
+        for (df::construction* c : other->cmembers) {
+            df::coord rel_pos = get_rel_pos(c->pos);
+            rel_positions.insert(rel_pos);
+            cmembers.insert(c);
+            if (rel_pos.z < lowest_relz) {
+                lowest_relz = rel_pos.z;
+            }
+        }
+        log << "merge CHECKPOINT 1" << std::endl;
+        for (df::building* b : other->bmembers) {
+            bmembers.insert(b);
+        }
+        log << "merge CHECKPOINT 2" << std::endl;
+        for (df::unit* u : other->umembers) {
+            umembers.insert(u);
+        }
+        log << "merge CHECKPOINT 3" << std::endl;
+        std::vector<df::map_block*> map_blocks;
+        Burrows::listBlocks(&map_blocks, other->um_burrow);
+        log << "merge CHECKPOINT 4" << std::endl;
+        int blocknum = 0;
+        for (df::map_block* block : map_blocks) {
+            log << "blocknum: " << blocknum++ << std::endl;
+            log << "block->map_pos: " << block->map_pos.x << " " << block->map_pos.y << " " << block->map_pos.z << std::endl;
+            df::block_burrow* mask1 = Burrows::getBlockMask(um_burrow, block, true);
+            log << "mask1: " << mask1 << std::endl;
+            df::block_burrow* mask2 = Burrows::getBlockMask(other->um_burrow, block, false);
+            log << "mask2: " << mask2 << std::endl;
+            for (int i=0; i<16; ++i) {
+                log << "i: " << i << std::endl;
+                mask1->tile_bitmask.bits[i] |= mask2->tile_bitmask.bits[i];
+            }
+        }
+        log << "merge CHECKPOINT 5" << std::endl;
     }
 
 	void update(unsigned int num_steps) {
@@ -385,6 +445,9 @@ struct MovingMachine {
                 c->pos.z + translatez
             };
             to_move.insert(std::make_pair(c, new_loc));
+            if (!in_map_bounds(new_loc)) {
+                return;
+            }
             if (!passable(new_loc) && !contains(new_loc)) {
                 register_collision(c, new_loc);
                 is_collision = true;
@@ -523,20 +586,30 @@ const std::set<df::tiletype> MovingMachine::OPEN_TILES {
 // Event binding/handling
 
 typedef std::map<df::coord, MovingMachine*> loc_map_t;
+typedef std::map<df::coord, std::set<MovingMachine*> > loc_mmap_t;
 
 std::vector<MovingMachine*> machines;
 loc_map_t oldlocs;
-loc_map_t newlocs;
+loc_mmap_t newlocs;
 
 void gen_newlocs(df::construction* c, MovingMachine* m) {
     for (int16_t dx = -1; dx <= 1; ++dx) {
         for (int16_t dy = -1; dy <= 1; ++dy) {
             if (dx == 0 && dy == 0) continue;
-            newlocs.insert(std::make_pair(df::coord {
+            df::coord newloc {
                 c->pos.x + dx,
                 c->pos.y + dy,
                 c->pos.z
-            }, m));
+            };
+            loc_mmap_t::iterator i = newlocs.find(newloc);
+            if (i == newlocs.end()) {
+                newlocs.insert(std::make_pair(
+                    newloc,
+                    std::set<MovingMachine*> { m }
+                ));
+            } else {
+                i->second.insert(m);
+            }
         }
     }
 }
@@ -547,8 +620,7 @@ void handle_new_platform(df::construction* c) {
     
     std::ofstream log("moving-machines-log.txt", std::ios_base::app);
     log << "handle_new_platform" << std::endl;
-    if (c->flags.whole & C_FLAG_PLATFORM) return;
-    loc_map_t::iterator i = newlocs.find(c->pos);
+    loc_mmap_t::iterator i = newlocs.find(c->pos);
 	MovingMachine* m;
 	if (i == newlocs.end()) {
         log << "NEW machine" << std::endl;
@@ -556,13 +628,46 @@ void handle_new_platform(df::construction* c) {
 		machines.push_back(m);
 	} else {
         log << "OLD machine" << std::endl;
-		m = i->second;
+        std::set<MovingMachine*>& mv_machines = i->second;
+		m = *mv_machines.begin();
         df::coord rel_pos = m->get_rel_pos(c->pos);
         m->rel_positions.insert(rel_pos);
         if (rel_pos.z < m->lowest_relz) {
             m->lowest_relz = rel_pos.z;
         }
 		m->cmembers.insert(c);
+        for (MovingMachine* next_m : mv_machines) {
+            if (next_m == m) continue;
+            log << "claimed by another moving-machine; initiating merge" << std::endl;
+            m->merge(next_m);
+            log << "CHECKPOINT 1" << std::endl;
+            for (loc_map_t::iterator j=oldlocs.begin();
+                   j!=oldlocs.end(); ++j) {
+                if (j->second == next_m) j->second = m;
+            }
+            log << "CHECKPOINT 2" << std::endl;
+            int jnum = 0;
+            
+            for (loc_mmap_t::iterator j=newlocs.begin(); 
+                   j!=newlocs.end(); ++j) {
+                log << "jnum: " << jnum++ << std::endl;
+                std::set<MovingMachine*>::iterator k = j->second.find(next_m);
+                if (k != j->second.end()) {
+                    j->second.erase(k);
+                    j->second.insert(m);
+                }
+            }
+            machines.erase(std::find(
+                machines.begin(),
+                machines.end(),
+                next_m
+            ));
+            log << "CHECKPOINT 3" << std::endl;
+            delete next_m;
+            log << "CHECKPOINT 4" << std::endl;
+            log << "CHECKPOINT 5" << std::endl;
+        }
+        newlocs.erase(i);
 	}
 	oldlocs.insert(std::make_pair(c->pos, m));
 	gen_newlocs(c, m);
@@ -793,12 +898,12 @@ void desig_platform(df::coord corner1, df::coord corner2) {
             for (int16_t z = min_z; z <= max_z; ++z) {
                 df::coord pos { x, y, z };
                 df::construction* c = df::construction::find(pos);
-                if (c != nullptr) {
-                    handle_new_platform(c);
-                    df::building* b = Buildings::findAtTile(pos);
-                    if (b != nullptr) {
-                        b->flags.whole &= ~B_FLAG_CLEARED;
-                    }
+                if (c == nullptr) continue;
+                if (c->flags.whole & C_FLAG_PLATFORM) continue;
+                handle_new_platform(c);
+                df::building* b = Buildings::findAtTile(pos);
+                if (b != nullptr) {
+                    b->flags.whole &= ~B_FLAG_CLEARED;
                 }
             }
         }
@@ -1208,17 +1313,24 @@ DFhackCExport command_result plugin_init(
 	       	false,
 		"=====TODO====\n"
 	));
-	return start_system(out, { "start" });
+	return CR_OK;
 }
 
-DFhackCExport command_result plugin_shutdown(color_ostream& out) {
-	command_result result = stop_system(out, { "stop" });
-	std::for_each(
+void shutdown_system() {
+    std::for_each(
 		machines.begin(),
 		machines.end(),
 		[](MovingMachine* ptr) { delete ptr; }
 	);
-	return result;
+    machines.clear();
+    newlocs.clear();
+    oldlocs.clear();
+}
+
+DFhackCExport command_result plugin_shutdown(color_ostream& out) {
+	command_result ret = stop_system(out, { "stop" });
+	shutdown_system();
+	return ret;
 }
 
 DFhackCExport command_result plugin_onupdate(color_ostream& out) {
@@ -1227,7 +1339,7 @@ DFhackCExport command_result plugin_onupdate(color_ostream& out) {
     if (*pause_state) return CR_OK;
 	if (world->frame_counter % speed == 0) {
 		update_machines(out, { "update" });
-        for (df::building* b : df::building::get_vector()) {
+        for (df::building* b : world->buildings.all) {
             if (b->flags.whole & B_FLAG_CLEARED) continue;
             if (b->getBuildStage() < b->getMaxBuildStage()) continue;
             handle_new_building(b);
@@ -1235,4 +1347,44 @@ DFhackCExport command_result plugin_onupdate(color_ostream& out) {
         }
 	}
 	return CR_OK;
+}
+
+DFhackCExport command_result plugin_onstatechange(color_ostream& out,
+                                                  state_change_event event) {
+    std::ofstream log("moving-machines-log.txt", std::ios_base::app);
+    CoreSuspender suspender;
+    command_result ret;
+    int cnum = 0;
+    switch (event) {
+        case SC_MAP_LOADED:
+            log << "SC_MAP_LOADED" << std::endl;
+            if (!World::isFortressMode()) {
+                ret = CR_OK;
+                break;
+            }
+            log << "World::isFortressMode()" << std::endl;
+            ret = start_system(out, { "start" });
+            log << "started system" << std::endl;
+            for (df::building* b : world->buildings.all) {
+                log << "b->id: " << b->id << std::endl;
+                if (b->getBuildStage() < b->getMaxBuildStage()) continue;
+                log << "handling new building" << std::endl;
+                handle_new_building(b);
+            }
+            for (df::construction* c : world->constructions) {
+                log << "cnum: " << cnum++ << std::endl;
+                if (!(c->flags.whole & C_FLAG_PLATFORM)) continue;
+                log << "handling new platform" << std::endl;
+                handle_new_platform(c);
+            }
+            break;
+        case SC_MAP_UNLOADED:
+            ret = stop_system(out, { "stop" });
+            shutdown_system();
+            break;
+        default:
+            ret = CR_OK;
+            break;
+    }
+    return ret;
 }
